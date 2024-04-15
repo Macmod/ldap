@@ -12,6 +12,8 @@ import (
 
 	"github.com/Azure/go-ntlmssp"
 	ber "github.com/go-asn1-ber/asn1-ber"
+	"github.com/jcmturner/gokrb5/v8/client"
+	"github.com/jcmturner/gokrb5/v8/spnego"
 )
 
 // SimpleBindRequest represents a username/password bind operation
@@ -732,4 +734,98 @@ RESP:
 	}
 
 	return nil, GetLDAPError(packet)
+}
+
+// GSS-SPNEGO Bind Request
+type SPNEGOBindRequest struct {
+	// Service Principal Name user for the service ticket. Eg. "ldap/<host>"
+	ServicePrincipalName string
+	// Authorization entity to authenticate as
+	Username string
+	// Authenticated KRB5 client as an abstraction over Credentials coming from a keytab,
+	// ccache or freshly acquired from the KDC
+	Client *client.Client
+	// Token
+	Token []byte
+	// Optional controls to send with the bind request
+	Controls []Control
+}
+
+// GSSAPIBindResult contains the response from the server
+type SPNEGOBindResult struct {
+	Controls []Control
+}
+
+// SPNEGOBind performs the GSS-SPNEGO SASL bind using the provided GSSAPI client
+func (l *Conn) SPNEGOBind(cl *client.Client, spn string) (*SPNEGOBindResult, error) {
+	var err error
+	result := &SPNEGOBindResult{
+		Controls: make([]Control, 0),
+	}
+
+	username := cl.Credentials.UserName()
+
+	sp := spnego.SPNEGOClient(cl, spn)
+	sp_token, err := sp.InitSecContext()
+	if err != nil {
+		return result, err
+	}
+	token, err := sp_token.Marshal()
+	if err != nil {
+		return result, err
+	}
+
+	req := &SPNEGOBindRequest{
+		ServicePrincipalName: spn,
+		Username:             username,
+		Token:                token,
+		Client:               cl,
+	}
+
+	// Send request steps
+	msgCtx, err := l.doRequest(req)
+	if err != nil {
+		return result, err
+	}
+	defer l.finishMessage(msgCtx)
+
+	packet, err := l.readPacket(msgCtx)
+	if err != nil {
+		return result, err
+	}
+
+	l.Debug.Printf("%d: got response %p", msgCtx.id, packet)
+	if l.Debug {
+		if err = addLDAPDescriptions(packet); err != nil {
+			return result, err
+		}
+		ber.PrintPacket(packet)
+	}
+
+	if len(packet.Children) != 2 {
+		return nil, fmt.Errorf("bad bind response")
+	}
+
+	return result, err
+}
+
+func (req *SPNEGOBindRequest) appendTo(envelope *ber.Packet) error {
+	// Construct LDAP Bind request with GSS-SPNEGO SASL mechanism.
+	request := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ApplicationBindRequest, nil, "Bind Request")
+	request.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, 3, "Version"))
+	request.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, req.Username, "User Name"))
+
+	auth := ber.Encode(ber.ClassContext, ber.TypeConstructed, 3, "", "authentication")
+	auth.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "GSS-SPNEGO", "SASL Mech"))
+	if len(req.Token) > 0 {
+		auth.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, string(req.Token[:]), "Credentials"))
+	}
+
+	request.AppendChild(auth)
+	envelope.AppendChild(request)
+	if len(req.Controls) > 0 {
+		envelope.AppendChild(encodeControls(req.Controls))
+	}
+
+	return nil
 }
